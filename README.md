@@ -36,18 +36,28 @@ The service supports searching by images or text and includes a health-check end
 
 ## Setup & Installation
 
+1. Install Tesseract
+   - ***Ubuntu/Debian**
+   ```bash
+   sudo apt update
+   sudo apt install -y tesseract-ocr
+   ```
+   - ***macOS (Homebrew)**
+   ```bash
+   brew install tesseract
+   ```
 
-1. **Install Dependencies**. Ensure you have Python 3.8+ installed:
+2. **Install Dependencies**. Ensure you have Python 3.8+ installed:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **Run the Service**:
+3. **Run the Service**:
    ```bash
    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
    ```
 
-3. **Test the API**:
+4. **Test the API**:
    ```bash
    curl http://localhost:8000/health
    ```
@@ -75,7 +85,7 @@ The service supports searching by images or text and includes a health-check end
 - **POST /search_by_image**: Finds the most similar images in FAISS.
    ```bash
    curl -X 'POST' \
-  'http://localhost:8000/search_by_image' \
+  'http://localhost:8000/search_drawing' \
   -H 'accept: application/json' \
   -H 'Content-Type: multipart/form-data' \
   -F 'file=@path/to/your/query_image.jpg'
