@@ -10,22 +10,31 @@ import pytesseract
 from transformers import ViTImageProcessor, ViTModel
 from PIL import Image
 
-# 🔹 Setup Logging
+# Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 🔹 Check if MPS GPU is available
-device = torch.device("mps" if torch.backends.mps.is_available() and torch.backends.mps.is_built() else "cpu")
-logger.info(f"Using device: {device}")
+# Automatically select the best available device (CUDA, MPS, or CPU)
+if torch.cuda.is_available():
+    device = torch.device("cuda")  # Use CUDA for NVIDIA GPUs
+    logger.info(f"🚀 Using CUDA (GPU) - {torch.cuda.get_device_name(0)}")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")  # Use MPS for Apple Silicon (Mac)
+    logger.info("🚀 Using MPS (Mac GPU)")
+else:
+    device = torch.device("cpu")  # Default to CPU
+    logger.info("🚀 Using CPU")
 
-# 🔹 FAISS Parameters
-D_IMAGE = 768  # The vector size of image embeddings
-INDEX_FILE = "faiss_index.faiss"
+# FAISS Parameters
+D_IMAGE = 2048  # Vector size after concatenating Mean + Max Pooling
+M = 32  # Number of neighbors for HNSW
+efSearch = 300  # Number of candidates during search (higher = more accurate)
+INDEX_FILE = "faiss_index_hnsw.faiss"
 DB_FILE = "id_mapping.db"
 
-# 🔹 Ensure SQLite Database Exists
+# Initialize SQLite Database
 def initialize_database():
-    """Create the SQLite database and table if they do not exist."""
+    """ Creates or connects to an SQLite database to store image metadata. """
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
     cur.execute(
@@ -42,132 +51,109 @@ def initialize_database():
 
 conn, cur = initialize_database()
 
-# 🔹 Load FAISS Index
+# Load FAISS Index
 try:
     if os.path.exists(INDEX_FILE):
         index = faiss.read_index(INDEX_FILE)
-        logger.info("✅ FAISS index loaded from file!")
+        logger.info("✅ FAISS HNSW index loaded from file!")
     else:
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(D_IMAGE))  # Use IndexIDMap to store image IDs
-        logger.info("🆕 New FAISS index initialized!")
+        index = faiss.IndexHNSWFlat(D_IMAGE, M)
+        index.hnsw.efSearch = efSearch  # Improve search accuracy
+        index = faiss.IndexIDMap(index)
+        logger.info("🆕 New FAISS HNSW index initialized!")
 except Exception as e:
     logger.error(f"Error loading FAISS index: {e}")
 
-# 🔹 Load AI Models
-logger.info("🚀 Loading ViT model...")
-vit_model = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k').to(device)
-vit_processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224-in21k')
-logger.info("✅ Models loaded successfully!")
+# Load ViT-Large Model
+logger.info("🚀 Loading ViT-Large model...")
+vit_model = ViTModel.from_pretrained('google/vit-large-patch16-224-in21k').to(device)
+vit_processor = ViTImageProcessor.from_pretrained('google/vit-large-patch16-224-in21k')
+logger.info("✅ ViT-Large model loaded successfully!")
 
-# 🔹 Function to Extract Image Features (with normalization)
+# Function to Extract Image Features
 def extract_vit_embedding(image_bytes):
-    """Extract image embeddings using ViT model."""
+    """ Extracts image embeddings using ViT-Large with Mean + Max Pooling. """
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         inputs = vit_processor(images=image, return_tensors="pt").to(device)
 
         with torch.no_grad():
             outputs = vit_model(**inputs)
-            embedding = outputs.pooler_output if outputs.pooler_output is not None else outputs.last_hidden_state[:, 0]
+            mean_features = outputs.last_hidden_state.mean(dim=1)  # Mean Pooling
+            max_features = outputs.last_hidden_state.max(dim=1).values  # Max Pooling
 
-        embedding = embedding.squeeze(0).cpu().numpy().astype(np.float32)
-        embedding /= np.linalg.norm(embedding)  # Normalize the vector
+        combined_features = torch.cat((mean_features, max_features), dim=1)  # Concatenate Mean + Max
+        embedding = combined_features.squeeze(0).cpu().numpy().astype(np.float32)
+        embedding /= np.linalg.norm(embedding)  # Normalize vector for better FAISS search
+
         return embedding
     except Exception as e:
         logger.error(f"Error processing image: {str(e)}")
         return None
 
-# 🔹 Function to Extract Text from Image using OCR
+# Function to Extract Text from Image using OCR
 def extract_text_from_image(image_bytes):
-    """Extract text from an image using OCR (Tesseract)."""
+    """ Extracts text from an image using OCR (Tesseract). """
     image = Image.open(io.BytesIO(image_bytes))
     return pytesseract.image_to_string(image).strip()
 
-# 🔹 Initialize FastAPI
+# Initialize FastAPI
 app = FastAPI()
 
-# 🔹 API: Health Check
-@app.get("/health")
-async def health_check():
-    """Check the health of the system."""
-    return {
-        "faiss_index_size": index.ntotal,
-        "gpu_available": torch.backends.mps.is_available(),
-        "device": str(device),
-        "vit_model": "working"
-    }
-
-# 🔹 API: Add Image Vector (With OCR Text Extraction)
+# API: Add Image Vector
 @app.post("/add_drawing")
-async def add_vector(id: str = Form(...), file: UploadFile = File(...), similarity_threshold: float = 0.1):
+async def add_vector(id: str = Form(...), file: UploadFile = File(...)):
     """
-    Add an image vector to FAISS index. If a similar image exists, update its text content instead.
+    Adds an image to the FAISS index along with its extracted text.
+    - If the image ID already exists, only the text is updated.
     """
     image_bytes = await file.read()
     image_vector = extract_vit_embedding(image_bytes)
     image_text = extract_text_from_image(image_bytes)
-
+    
     if image_vector is None:
         return {"message": "Error processing image", "id": None}
 
     image_vector = np.expand_dims(image_vector, axis=0)
-
-    # 🔹 Check if ID already exists
+    
+    # Check if the image ID already exists
     cur.execute("SELECT faiss_id FROM id_mapping WHERE str_id=?", (id,))
     existing_record = cur.fetchone()
-
+    
     if existing_record:
-        # 🔹 If ID already exists, only update text content
         cur.execute("UPDATE id_mapping SET text_content = ? WHERE str_id = ?", (image_text, id))
         conn.commit()
-        return {"message": "Image ID already exists, text content updated", "id": id}
+        return {"message": "Image ID exists, text updated", "id": id}
 
-    # 🔹 Search for Similar Images
-    if index.ntotal > 0:
-        distances, indices = index.search(image_vector, k=1)
-        existing_faiss_id = indices[0][0]
-        existing_distance = distances[0][0]
-
-        if existing_faiss_id != -1 and existing_distance < similarity_threshold:
-            # 🔹 If a similar image exists in FAISS, update text content instead of inserting a new record
-            cur.execute("UPDATE id_mapping SET text_content = ? WHERE faiss_id = ?", (image_text, existing_faiss_id))
-            conn.commit()
-            return {"message": "Similar image already exists, text content updated", "existing_id": id, "distance": float(existing_distance)}
-
-    # 🔹 Generate FAISS ID
+    # Generate a new FAISS ID
     cur.execute("SELECT COALESCE(MAX(faiss_id), 0) FROM id_mapping")
     faiss_id = cur.fetchone()[0] + 1  
-
-    # 🔹 Store in SQLite (Text Data Included)
     cur.execute("INSERT INTO id_mapping (str_id, faiss_id, text_content) VALUES (?, ?, ?)", (id, faiss_id, image_text))
     conn.commit()
 
-    # 🔹 Add to FAISS
-    index.add_with_ids(image_vector, np.array([faiss_id], dtype=np.int64))  # Ensure FAISS supports ID storage
-
+    index.add_with_ids(image_vector, np.array([faiss_id], dtype=np.int64))
     return {"message": "Vector added successfully", "id": id}
 
-# 🔹 API: Search by Image
+# API: Search by Image
 @app.post("/search_drawing")
 async def search_by_image(file: UploadFile = File(...), top_k: int = 10):
     """
-    Search FAISS index for the most similar images.
-    Returns the closest image IDs and distances.
+    Searches for similar images in the FAISS index using image embeddings.
+    Returns the top_k most similar images along with their similarity scores.
     """
     image_bytes = await file.read()
     query_vector = extract_vit_embedding(image_bytes)
+    
     if query_vector is None:
         return {"message": "Error processing image"}
-
+    
     query_vector = np.expand_dims(query_vector, axis=0)
 
     if index.ntotal == 0:
         return {"message": "No images in database"}
 
-    # 🔹 FAISS Search
     distances, indices = index.search(query_vector, k=top_k)
 
-    # 🔹 Convert FAISS ID to Original ID
     results = []
     for idx, dist in zip(indices[0], distances[0]):
         if idx != -1:
@@ -175,13 +161,13 @@ async def search_by_image(file: UploadFile = File(...), top_k: int = 10):
             result = cur.fetchone()
             if result:
                 results.append({"id": result[0], "distance": float(dist)})
-
+    
     return {"similar_drawings": results}
 
-# 🔹 Save FAISS index on shutdown
+# Save FAISS Index on Shutdown
 @app.on_event("shutdown")
 def save_faiss_index():
-    """Save FAISS index and close the database connection on shutdown."""
+    """ Saves the FAISS index and closes the database connection upon shutdown. """
     faiss.write_index(index, INDEX_FILE)
     conn.close()
-    logger.info("✅ FAISS index & SQLite mapping saved before shutdown!")
+    logger.info("✅ FAISS HNSW index & SQLite mapping saved!")

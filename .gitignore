@@ -171,3 +171,4 @@ cython_debug/
 .pypirc
 faiss_index.faiss
 id_mapping.db
+faiss_index_hnsw.faiss
