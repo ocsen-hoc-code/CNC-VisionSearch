@@ -1,5 +1,7 @@
 # CNC VISION SEARCH
 
+CNC-VisionSearch is an AI-powered search engine for CNC drawings, enabling users to search by image or text description. It leverages deep learning models (ViT & SBERT) and vector search (FAISS) to find similar mechanical drawings quickly and accurately.
+
 This repository contains a FastAPI service for:
 - Extracting image embeddings using a Vision Transformer (ViT).
 - Extracting text embeddings using SBERT (Sentence-BERT).
@@ -10,8 +12,8 @@ The service supports searching by images or text and includes a health-check end
 ## Features
 
 1. **Vision Transformer (ViT) Embeddings**  
-   - Uses [google/vit-base-patch16-224-in21k](https://huggingface.co/google/vit-base-patch16-224-in21k).  
-   - Processes images to produce 768-dimensional embeddings.  
+   - Uses [google/vit-large-patch16-224-in21k](https://huggingface.co/google/vit-large-patch16-224-in21k).  
+   - Processes images to produce 2048-dimensional embeddings.  
    - Normalizes embeddings before indexing or searching.
 
 2. **Sentence-BERT (SBERT) Embeddings**  
@@ -21,8 +23,8 @@ The service supports searching by images or text and includes a health-check end
 
 3. **FAISS for Similarity Search**  
    - Builds two FAISS indexes (for images and text).  
-   - Allows fast *k*-nearest-neighbor lookups using `IndexFlatL2`.  
-   - The index data is saved to and loaded from `faiss_index.pkl`.
+   - Allows fast *k*-nearest-neighbor lookups using `IndexHNSWFlat`.  
+   - The index data is saved to and loaded from `faiss_index_hnsw.faiss`.
 
 4. **MPS / CPU Support**  
    - Uses MPS on Apple Silicon if available; otherwise defaults to CPU.  
@@ -31,8 +33,8 @@ The service supports searching by images or text and includes a health-check end
 5. **FastAPI Endpoints**  
    - **GET /health**: Checks FAISS index status, model availability, and device info.
    - **POST /add_drawing**: Accepts an image file and an ID, extracts the image embedding with ViT, and adds it to the FAISS index.
-   - **POST /search_by_image**: Accepts an image file as a query and returns the most similar items (default top 1000).
-   - **GET /search_by_text**: Accepts a text query and returns the most similar items in the text index.
+   - **POST /search_drawing**: Accepts an image file as a query and returns the most similar items (default top 10).
+   - **GET /search_by_text**: Accepts a text query and returns the most similar items in the text index (under development).
 
 ## Setup & Installation
 
